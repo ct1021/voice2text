@@ -44,6 +44,7 @@ from PyQt6.QtGui import QPainter, QColor, QAction
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
     QListWidgetItem, QLabel, QPushButton, QTextEdit, QMenu, QFrame,
+    QMessageBox,
 )
 
 from config import load_config
@@ -56,6 +57,7 @@ CONFIG = load_config()
 HOTKEY = CONFIG["hotkey"]["key"]
 SAMPLE_RATE = CONFIG["audio"]["sample_rate"]
 MIN_DURATION_SEC = 0.3
+MAX_DURATION_SEC = 300
 MAX_HISTORY = 100
 
 HISTORY_FILE = APP_DIR / "history.jsonl"
@@ -143,12 +145,17 @@ def load_history() -> list:
     return items[-MAX_HISTORY:]
 
 
-def append_history(item: dict) -> None:
+def save_history(items: list) -> None:
+    """Rewrite history.jsonl with at most MAX_HISTORY most-recent items.
+
+    Rewriting (vs appending) keeps the file from growing without bound.
+    """
     try:
-        with HISTORY_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        with HISTORY_FILE.open("w", encoding="utf-8") as f:
+            for item in items[-MAX_HISTORY:]:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
     except Exception as e:
-        log(f"history append failed: {e}")
+        log(f"history save failed: {e}")
 
 
 # ===== Signal bus =====
@@ -288,6 +295,11 @@ class Backend:
             if duration < MIN_DURATION_SEC:
                 log(f"skip short {duration:.2f}s")
                 return
+            if duration > MAX_DURATION_SEC:
+                log(f"recording too long {duration:.0f}s, truncating")
+                bus.error.emit(f"录音过长，已截断到 {MAX_DURATION_SEC}s")
+                audio = audio[:int(MAX_DURATION_SEC * SAMPLE_RATE)]
+                duration = MAX_DURATION_SEC
             log(f"STT transcribing {duration:.1f}s...")
             t0 = time.time()
             try:
@@ -326,7 +338,6 @@ class Backend:
                 "cleaned": cleaned,
                 "ai_failed": ai_failed,
             }
-            append_history(item)
             bus.history_added.emit(item)
             log("done pasted")
         except Exception as e:
@@ -560,6 +571,7 @@ class HistoryPanel(QWidget):
         super().__init__()
         self.backend = backend
         self.history = load_history()
+        save_history(self.history)  # rewrite-truncate any oversized old file
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -654,12 +666,15 @@ class HistoryPanel(QWidget):
         b_ai = QPushButton("复制 AI 版")
         b_raw = QPushButton("复制原始")
         b_re = QPushButton("重粘贴")
+        b_clear = QPushButton("清空历史")
         b_ai.clicked.connect(lambda: self._copy("cleaned"))
         b_raw.clicked.connect(lambda: self._copy("raw"))
         b_re.clicked.connect(self._repaste)
+        b_clear.clicked.connect(self._clear_history)
         actions.addWidget(b_ai)
         actions.addWidget(b_raw)
         actions.addWidget(b_re)
+        actions.addWidget(b_clear)
         v.addLayout(actions)
 
         self._refresh_status("loading")
@@ -699,6 +714,7 @@ class HistoryPanel(QWidget):
     def _on_added(self, item: dict):
         self.history.append(item)
         self.history = self.history[-MAX_HISTORY:]
+        save_history(self.history)
         self._reload_list()
 
     def _selected(self):
@@ -736,6 +752,21 @@ class HistoryPanel(QWidget):
         time.sleep(0.06)
         send_paste()
         log("re-pasted")
+
+    def _clear_history(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("清空历史")
+        box.setText("确定清空所有历史记录？此操作不可撤销。")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self.history = []
+            save_history(self.history)
+            self._reload_list()
+            self.detail.clear()
+            log("history cleared")
 
 
 # ===== Main =====
