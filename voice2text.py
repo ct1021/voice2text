@@ -1,10 +1,9 @@
-"""voice2text v2 - PyQt6 floating ball + history panel.
+"""voice2text - hold a hotkey to dictate; transcribe + AI-clean + paste.
 
-Hold CapsLock to dictate. Release to transcribe -> Claude clean -> paste.
-A draggable floating ball shows state (gray/red/orange).
-Click the ball to toggle the history panel.
+A floating ball on the desktop shows state (gray/red/orange/purple).
+Click it to toggle the history panel. Right-click for the menu.
+All settings live in config.toml (auto-created from config.example.toml).
 """
-import asyncio
 import json
 import queue
 import subprocess
@@ -20,6 +19,7 @@ if sys.stdout is None:
     sys.stdout = _log_fp
     sys.stderr = _log_fp
 
+# Hide subprocess console windows on Windows (claude-agent-sdk spawns claude.cmd).
 if sys.platform == "win32":
     _orig_popen_init = subprocess.Popen.__init__
 
@@ -39,7 +39,6 @@ import numpy as np
 import pyperclip
 import sounddevice as sd
 import keyboard as kb
-import winsound
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor, QAction
@@ -47,33 +46,30 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
     QListWidgetItem, QLabel, QPushButton, QTextEdit, QMenu, QFrame,
 )
-from faster_whisper import WhisperModel
-from claude_agent_sdk import (
-    query, ClaudeAgentOptions, AssistantMessage, TextBlock,
-)
 
-# ===== Paths =====
-MODEL_DIR = APP_DIR / "models"
-HISTORY_FILE = APP_DIR / "history.jsonl"
-CONFIG_FILE = APP_DIR / "ui_config.json"
+from config import load_config
+from stt import make_engine
+from ai import make_cleaner, NoOpCleaner
 
-# ===== Audio / Model =====
-HOTKEY = "caps lock"
-SAMPLE_RATE = 16000
-MODEL_NAME = "medium"
+# ===== Config =====
+CONFIG = load_config()
+HOTKEY = CONFIG["hotkey"]["key"]
+SAMPLE_RATE = CONFIG["audio"]["sample_rate"]
 MIN_DURATION_SEC = 0.3
 MAX_HISTORY = 100
 
+HISTORY_FILE = APP_DIR / "history.jsonl"
+UI_CONFIG_FILE = APP_DIR / "ui_config.json"
+
+# ===== Glossary =====
 DEFAULT_GLOSSARY = (
     "Claude Code, Claude, ChatGPT, Codex, Cursor, GitHub, Git, "
     "Python, JavaScript, TypeScript, Node.js, Docker, WSL, PowerShell, "
-    "Linux, Ubuntu, API, SDK, MCP, LLM, prompt, token, "
-    "faster-whisper, SenseVoice, Whisper, ASR, TTS, PyQt, npm, pip, uv"
+    "API, SDK, MCP, LLM, faster-whisper, SenseVoice, Whisper"
 )
 
 
 def _load_glossary() -> str:
-    """Load user glossary.txt (gitignored, personal terms) or fall back."""
     gf = APP_DIR / "glossary.txt"
     if gf.exists():
         try:
@@ -91,47 +87,44 @@ def _load_glossary() -> str:
 
 GLOSSARY = _load_glossary()
 
-SYSTEM_PROMPT = f"""你是语音转写清洗专家。任务：
-1. 修正 ASR 转写错误，特别是技术专有名词（参考下方词典）
-2. 加合理标点
-3. 保持原意，不增删信息
-
-专有名词词典：
-{GLOSSARY}
-
-输出：只输出清洗后的纯文本一行，不要解释，不要任何前缀或后缀。"""
-
-COLORS = {
-    "idle":    QColor(140, 140, 140),
-    "loading": QColor(100, 130, 200),
-    "rec":     QColor(231, 76, 60),
-    "proc":    QColor(243, 156, 18),
-}
-
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def load_config() -> dict:
-    defaults = {"ball_x": -1, "ball_y": -1}
-    if CONFIG_FILE.exists():
+def beep(ok: bool = True) -> None:
+    """Feedback sound. Windows only; silent elsewhere (Mac/Linux TODO)."""
+    if sys.platform == "win32":
         try:
-            defaults.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+            import winsound
+            winsound.MessageBeep(
+                winsound.MB_OK if ok else winsound.MB_ICONEXCLAMATION
+            )
         except Exception:
             pass
-    return defaults
 
 
-def save_config(cfg: dict) -> None:
+# ===== UI config (ball position, intro flag) =====
+def load_ui_config() -> dict:
+    d = {"ball_x": -1, "ball_y": -1, "intro_shown": False}
+    if UI_CONFIG_FILE.exists():
+        try:
+            d.update(json.loads(UI_CONFIG_FILE.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return d
+
+
+def save_ui_config(d: dict) -> None:
     try:
-        CONFIG_FILE.write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        UI_CONFIG_FILE.write_text(
+            json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    except Exception as e:
-        log(f"save_config failed: {e}")
+    except Exception:
+        pass
 
 
+# ===== History =====
 def load_history() -> list:
     items = []
     if HISTORY_FILE.exists():
@@ -156,11 +149,21 @@ def append_history(item: dict) -> None:
 
 # ===== Signal bus =====
 class Bus(QObject):
-    state = pyqtSignal(str)
+    state = pyqtSignal(str)            # idle | loading | rec | proc
     history_added = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    prompt_changed = pyqtSignal(str)
 
 
 bus = Bus()
+
+COLORS = {
+    "idle":    QColor(140, 140, 140),
+    "loading": QColor(100, 130, 200),
+    "rec":     QColor(231, 76, 60),
+    "proc":    QColor(243, 156, 18),
+    "error":   QColor(155, 89, 182),
+}
 
 
 # ===== Backend =====
@@ -169,45 +172,76 @@ class Backend:
         self.audio_q: queue.Queue = queue.Queue()
         self.recording = False
         self.processing_lock = threading.Lock()
-        self.model = None
+        self.engine = None
+        self.cleaner = None
         self.stream = None
         self.ready = False
+        self.current_prompt = CONFIG["ai"]["prompt"]
 
     def start_async(self):
         threading.Thread(target=self._init, daemon=True).start()
 
+    def _resolve_device(self):
+        name = CONFIG["audio"]["device"].strip()
+        if not name:
+            return None
+        try:
+            for i, dev in enumerate(sd.query_devices()):
+                if (dev["max_input_channels"] > 0
+                        and name.lower() in dev["name"].lower()):
+                    log(f"mic device: {dev['name']}")
+                    return i
+        except Exception as e:
+            log(f"device query failed: {e}")
+        log(f"mic '{name}' not found, using default")
+        return None
+
     def _init(self):
         try:
-            log("loading faster-whisper medium...")
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            self.model = WhisperModel(
-                MODEL_NAME, device="cpu", compute_type="int8",
-                download_root=str(MODEL_DIR),
-            )
-            log("model ready")
+            log(f"loading STT backend: {CONFIG['stt']['backend']}...")
+            self.engine = make_engine(CONFIG["stt"])
+            log(f"STT ready: {self.engine.name}")
+        except Exception as e:
+            log(f"STT init failed: {e}")
+            bus.error.emit(f"STT 初始化失败: {e}")
+            return
+        try:
+            self.cleaner = make_cleaner(CONFIG["ai"])
+            log(f"AI ready: {self.cleaner.name}")
+        except Exception as e:
+            log(f"AI init failed: {e}")
+            bus.error.emit(f"AI 后端初始化失败，已降级为不清洗: {e}")
+            self.cleaner = NoOpCleaner()
+        try:
             self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, callback=self._audio_cb,
+                samplerate=SAMPLE_RATE, channels=1,
+                callback=self._audio_cb, device=self._resolve_device(),
             )
             self.stream.start()
+        except Exception as e:
+            log(f"mic failed: {e}")
+            bus.error.emit(f"麦克风打开失败: {e}")
+            return
+        try:
             kb.on_press_key(HOTKEY, self._on_press, suppress=True)
             kb.on_release_key(HOTKEY, self._on_release, suppress=True)
-            self.ready = True
-            bus.state.emit("idle")
-            log("backend ready - hold CapsLock to dictate")
         except Exception as e:
-            log(f"backend init failed: {e}")
+            log(f"hotkey failed: {e}")
+            bus.error.emit(f"热键 '{HOTKEY}' 注册失败: {e}")
+            return
+        self.ready = True
+        bus.state.emit("idle")
+        log(f"backend ready - hold {HOTKEY} to dictate")
 
-    def stop(self):
-        try:
-            kb.unhook_all()
-        except Exception:
-            pass
-        try:
-            if self.stream:
-                self.stream.stop()
-                self.stream.close()
-        except Exception:
-            pass
+    def set_prompt(self, name: str):
+        self.current_prompt = name
+        bus.prompt_changed.emit(name)
+        log(f"prompt template -> {name}")
+
+    def _system_prompt(self) -> str:
+        prompts = CONFIG["ai"]["prompts"]
+        template = prompts.get(self.current_prompt) or prompts.get("default", "")
+        return f"{template}\n\n专有名词参考词典：\n{GLOSSARY}"
 
     def _audio_cb(self, indata, frames, time_info, status):
         if self.recording:
@@ -216,12 +250,11 @@ class Backend:
     def _on_press(self, _e):
         if self.recording:
             return
+        if not self.ready:
+            return
         if self.processing_lock.locked():
             log("REC ignored - busy")
-            try:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            except Exception:
-                pass
+            beep(ok=False)
             return
         self.recording = True
         while not self.audio_q.empty():
@@ -260,32 +293,33 @@ class Backend:
                 return
             log(f"STT transcribing {duration:.1f}s...")
             t0 = time.time()
-            segments, _ = self.model.transcribe(
-                audio, language="zh", initial_prompt=GLOSSARY,
-                beam_size=1, vad_filter=True,
-            )
-            raw = "".join(s.text for s in segments).strip()
+            try:
+                raw = self.engine.transcribe(audio, GLOSSARY)
+            except Exception as e:
+                log(f"STT failed: {e}")
+                bus.error.emit(f"转写失败: {e}")
+                return
             stt_sec = time.time() - t0
             log(f"STT {stt_sec:.2f}s -> {raw}")
             if not raw:
                 log("skip empty transcription")
                 return
             t1 = time.time()
+            ai_failed = False
             try:
-                cleaned = asyncio.run(self._clean(raw))
-                ai_sec = time.time() - t1
-                log(f"AI {ai_sec:.2f}s -> {cleaned}")
+                cleaned = self.cleaner.clean(raw, self._system_prompt())
             except Exception as e:
-                log(f"AI failed {e}")
+                log(f"AI clean failed: {e}")
+                bus.error.emit(f"AI 清洗失败，已用原始转写: {e}")
                 cleaned = raw
-                ai_sec = 0.0
+                ai_failed = True
+            ai_sec = time.time() - t1
+            if not cleaned:
+                cleaned = raw
             pyperclip.copy(cleaned)
             time.sleep(0.08)
             kb.send("ctrl+v")
-            try:
-                winsound.MessageBeep(winsound.MB_OK)
-            except Exception:
-                pass
+            beep(ok=True)
             item = {
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "duration": round(duration, 1),
@@ -293,60 +327,118 @@ class Backend:
                 "ai_sec": round(ai_sec, 2),
                 "raw": raw,
                 "cleaned": cleaned,
+                "prompt": self.current_prompt,
+                "ai_failed": ai_failed,
             }
             append_history(item)
             bus.history_added.emit(item)
             log("done pasted")
+        except Exception as e:
+            log(f"process error: {e}")
+            bus.error.emit(f"处理出错: {e}")
         finally:
             self.processing_lock.release()
             bus.state.emit("idle")
 
-    async def _clean(self, text: str) -> str:
-        options = ClaudeAgentOptions(
-            system_prompt=SYSTEM_PROMPT, max_turns=1, allowed_tools=[],
-        )
-        parts: list[str] = []
-        async for msg in query(prompt=text, options=options):
-            if isinstance(msg, AssistantMessage):
-                for b in msg.content:
-                    if isinstance(b, TextBlock):
-                        parts.append(b.text)
-        return "".join(parts).strip()
+    def stop(self):
+        try:
+            kb.unhook_all()
+        except Exception:
+            pass
+        try:
+            if self.stream:
+                self.stream.stop()
+                self.stream.close()
+        except Exception:
+            pass
 
 
-# ===== Floating ball =====
-class FloatingBall(QWidget):
-    BALL_SIZE = 44
-
-    def __init__(self, panel: "HistoryPanel"):
+# ===== Intro bubble (first-run guidance) =====
+class IntroBubble(QWidget):
+    def __init__(self):
         super().__init__()
-        self.panel = panel
-        self.state = "loading"
-        self.drag_offset = None
-        self._moved = False
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.resize(self.BALL_SIZE, self.BALL_SIZE)
-        self.setToolTip("Voice2Text · 加载中...")
-        cfg = load_config()
-        if cfg["ball_x"] >= 0:
-            self.move(cfg["ball_x"], cfg["ball_y"])
-        else:
-            screen = QApplication.primaryScreen().availableGeometry()
-            self.move(screen.right() - 80, screen.bottom() - 200)
-        bus.state.connect(self._on_state)
-        # pulse animation timer
+        self.resize(300, 110)
+        frame = QFrame(self)
+        frame.setGeometry(0, 0, 300, 110)
+        frame.setStyleSheet("""
+            QFrame {
+                background-color: rgba(40, 40, 48, 248);
+                border-radius: 10px;
+                border: 1px solid rgba(255, 255, 255, 45);
+            }
+            QLabel { color: #eee; font-size: 12px; }
+        """)
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(14, 12, 14, 12)
+        label = QLabel(
+            f"👋 我是 Voice2Text\n\n"
+            f"按住 {HOTKEY} 说话，松开自动转写并粘贴。\n"
+            f"单击我打开历史面板，右键我看菜单。"
+        )
+        label.setWordWrap(True)
+        lay.addWidget(label)
+
+    def show_near(self, ball: QWidget):
+        x = ball.x() - self.width() - 12
+        if x < 0:
+            x = ball.x() + ball.width() + 12
+        self.move(x, max(0, ball.y() - 30))
+        self.show()
+        QTimer.singleShot(9000, self.close)
+
+
+# ===== Floating ball =====
+class FloatingBall(QWidget):
+    def __init__(self, panel: "HistoryPanel", backend: Backend):
+        super().__init__()
+        self.panel = panel
+        self.backend = backend
+        self.size_px = CONFIG["ui"]["ball_size"]
+        self.state = "loading"
+        self.drag_offset = None
+        self._moved = False
         self._pulse = 0
+        self._intro = None
+
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        if CONFIG["ui"]["always_on_top"]:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.resize(self.size_px, self.size_px)
+
+        self.ui_cfg = load_ui_config()
+        if self.ui_cfg["ball_x"] >= 0:
+            self.move(self.ui_cfg["ball_x"], self.ui_cfg["ball_y"])
+        else:
+            scr = QApplication.primaryScreen().availableGeometry()
+            self.move(scr.right() - 80, scr.bottom() - 200)
+
+        bus.state.connect(self._on_state)
+        bus.error.connect(self._on_error)
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(80)
+        self._err_timer = QTimer(self)
+        self._err_timer.setSingleShot(True)
+        self._err_timer.timeout.connect(lambda: self._set_state("idle"))
+
+    def show_intro_if_needed(self):
+        if not self.ui_cfg.get("intro_shown"):
+            self._intro = IntroBubble()
+            self._intro.show_near(self)
+            self.ui_cfg["intro_shown"] = True
+            save_ui_config(self.ui_cfg)
 
     def _tick(self):
-        if self.state in ("rec", "proc", "loading"):
+        if self.state in ("rec", "proc", "loading", "error"):
             self._pulse = (self._pulse + 1) % 20
             self.update()
 
@@ -354,33 +446,39 @@ class FloatingBall(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = COLORS.get(self.state, COLORS["idle"])
-        # outer halo (pulse on active states)
         halo = QColor(color)
-        if self.state in ("rec", "proc", "loading"):
-            alpha = 60 + int(60 * abs(self._pulse - 10) / 10)
+        if self.state in ("rec", "proc", "loading", "error"):
+            halo.setAlpha(60 + int(60 * abs(self._pulse - 10) / 10))
         else:
-            alpha = 60
-        halo.setAlpha(alpha)
+            halo.setAlpha(60)
         p.setBrush(halo)
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(0, 0, self.BALL_SIZE, self.BALL_SIZE)
-        # inner solid
+        p.drawEllipse(0, 0, self.size_px, self.size_px)
         p.setBrush(color)
-        p.drawEllipse(8, 8, self.BALL_SIZE - 16, self.BALL_SIZE - 16)
-        # white center dot
+        p.drawEllipse(8, 8, self.size_px - 16, self.size_px - 16)
         p.setBrush(QColor(255, 255, 255, 230))
-        p.drawEllipse(18, 18, self.BALL_SIZE - 36, self.BALL_SIZE - 36)
+        p.drawEllipse(18, 18, self.size_px - 36, self.size_px - 36)
 
-    def _on_state(self, state: str):
+    def _set_state(self, state: str):
         self.state = state
         tips = {
-            "idle":    "Voice2Text · 空闲（按住 CapsLock 说话）",
+            "idle":    "Voice2Text · 空闲（按住 {} 说话）".format(HOTKEY),
             "loading": "Voice2Text · 加载中...",
             "rec":     "Voice2Text · 录音中",
             "proc":    "Voice2Text · 处理中",
+            "error":   "Voice2Text · 出错（详见历史面板）",
         }
         self.setToolTip(tips.get(state, "Voice2Text"))
         self.update()
+
+    def _on_state(self, state: str):
+        if self.state == "error" and self._err_timer.isActive():
+            return  # keep error visible until its timer fires
+        self._set_state(state)
+
+    def _on_error(self, _msg: str):
+        self._set_state("error")
+        self._err_timer.start(5000)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -390,7 +488,7 @@ class FloatingBall(QWidget):
             self._show_menu(e.globalPosition().toPoint())
 
     def mouseMoveEvent(self, e):
-        if e.buttons() & Qt.MouseButton.LeftButton and self.drag_offset is not None:
+        if e.buttons() & Qt.MouseButton.LeftButton and self.drag_offset:
             self.move(e.globalPosition().toPoint() - self.drag_offset)
             self._moved = True
 
@@ -399,31 +497,26 @@ class FloatingBall(QWidget):
             if not self._moved:
                 self._toggle_panel()
             else:
-                # save new position
-                cfg = load_config()
-                cfg["ball_x"] = self.x()
-                cfg["ball_y"] = self.y()
-                save_config(cfg)
+                self.ui_cfg["ball_x"] = self.x()
+                self.ui_cfg["ball_y"] = self.y()
+                save_ui_config(self.ui_cfg)
             self.drag_offset = None
             self._moved = False
 
     def _toggle_panel(self):
         if self.panel.isVisible():
             self.panel.hide()
-        else:
-            screen = QApplication.primaryScreen().availableGeometry()
-            x = self.x() - self.panel.width() - 10
-            if x < screen.left() + 4:
-                x = self.x() + self.BALL_SIZE + 10
-            y = self.y() + self.BALL_SIZE // 2 - self.panel.height() // 2
-            if y < screen.top() + 4:
-                y = screen.top() + 4
-            if y + self.panel.height() > screen.bottom() - 4:
-                y = screen.bottom() - 4 - self.panel.height()
-            self.panel.move(x, y)
-            self.panel.show()
-            self.panel.raise_()
-            self.panel.activateWindow()
+            return
+        scr = QApplication.primaryScreen().availableGeometry()
+        x = self.x() - self.panel.width() - 10
+        if x < scr.left() + 4:
+            x = self.x() + self.size_px + 10
+        y = self.y() + self.size_px // 2 - self.panel.height() // 2
+        y = max(scr.top() + 4, min(y, scr.bottom() - 4 - self.panel.height()))
+        self.panel.move(x, y)
+        self.panel.show()
+        self.panel.raise_()
+        self.panel.activateWindow()
 
     def _show_menu(self, pos):
         menu = QMenu(self)
@@ -435,20 +528,39 @@ class FloatingBall(QWidget):
             }
             QMenu::item { padding: 6px 18px; border-radius: 4px; }
             QMenu::item:selected { background: rgba(255,255,255,30); }
+            QMenu::separator { height: 1px; background: rgba(255,255,255,25);
+                               margin: 4px 8px; }
         """)
-        a1 = QAction("显示历史", self)
-        a1.triggered.connect(self._toggle_panel)
-        menu.addAction(a1)
-        a2 = QAction("打开日志", self)
-        a2.triggered.connect(lambda: __import__("os").startfile(LOG_PATH))
-        menu.addAction(a2)
-        a3 = QAction("打开文件夹", self)
-        a3.triggered.connect(lambda: __import__("os").startfile(str(APP_DIR)))
-        menu.addAction(a3)
+        a_hist = QAction("显示历史", self)
+        a_hist.triggered.connect(self._toggle_panel)
+        menu.addAction(a_hist)
+
+        sub = menu.addMenu("清洗模板")
+        for name in CONFIG["ai"]["prompts"]:
+            mark = "  ✓" if name == self.backend.current_prompt else ""
+            act = QAction(f"{name}{mark}", self)
+            act.triggered.connect(
+                lambda _checked=False, n=name: self.backend.set_prompt(n)
+            )
+            sub.addAction(act)
+
         menu.addSeparator()
-        aq = QAction("退出", self)
-        aq.triggered.connect(QApplication.quit)
-        menu.addAction(aq)
+        import os
+        a_log = QAction("打开日志", self)
+        a_log.triggered.connect(lambda: os.startfile(LOG_PATH))
+        menu.addAction(a_log)
+        a_cfg = QAction("打开配置 config.toml", self)
+        a_cfg.triggered.connect(
+            lambda: os.startfile(str(APP_DIR / "config.toml"))
+        )
+        menu.addAction(a_cfg)
+        a_dir = QAction("打开文件夹", self)
+        a_dir.triggered.connect(lambda: os.startfile(str(APP_DIR)))
+        menu.addAction(a_dir)
+        menu.addSeparator()
+        a_quit = QAction("退出", self)
+        a_quit.triggered.connect(QApplication.quit)
+        menu.addAction(a_quit)
         menu.exec(pos)
 
 
@@ -457,8 +569,9 @@ class HistoryPanel(QWidget):
     WIDTH = 440
     HEIGHT = 500
 
-    def __init__(self):
+    def __init__(self, backend: Backend):
         super().__init__()
+        self.backend = backend
         self.history = load_history()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -470,6 +583,8 @@ class HistoryPanel(QWidget):
         self._build_ui()
         bus.history_added.connect(self._on_added)
         bus.state.connect(self._on_state)
+        bus.error.connect(self._on_error)
+        bus.prompt_changed.connect(lambda _n: self._refresh_status("idle"))
         self.hide()
 
     def _build_ui(self):
@@ -484,6 +599,7 @@ class HistoryPanel(QWidget):
             QLabel { color: #ddd; font-size: 13px; }
             QLabel#title { color: #fff; font-size: 15px; font-weight: bold; }
             QLabel#status { color: #aaa; font-size: 11px; }
+            QLabel#err { color: #e8a0c8; font-size: 11px; }
             QListWidget {
                 background: transparent; border: none; color: #ddd;
                 font-size: 12px; outline: none;
@@ -515,7 +631,7 @@ class HistoryPanel(QWidget):
         """)
         v = QVBoxLayout(frame)
         v.setContentsMargins(14, 12, 14, 12)
-        v.setSpacing(8)
+        v.setSpacing(7)
 
         head = QHBoxLayout()
         title = QLabel("Voice2Text · 历史")
@@ -529,9 +645,14 @@ class HistoryPanel(QWidget):
         head.addWidget(close_btn)
         v.addLayout(head)
 
-        self.status = QLabel("空闲 · 按住 CapsLock 录音")
+        self.status = QLabel("")
         self.status.setObjectName("status")
         v.addWidget(self.status)
+        self.err = QLabel("")
+        self.err.setObjectName("err")
+        self.err.setWordWrap(True)
+        self.err.hide()
+        v.addWidget(self.err)
 
         self.list = QListWidget()
         self.list.itemSelectionChanged.connect(self._on_select)
@@ -544,24 +665,47 @@ class HistoryPanel(QWidget):
         v.addWidget(self.detail, 1)
 
         actions = QHBoxLayout()
-        self.btn_copy_ai = QPushButton("复制 AI 版")
-        self.btn_copy_raw = QPushButton("复制原始")
-        self.btn_repaste = QPushButton("重粘贴")
-        self.btn_copy_ai.clicked.connect(lambda: self._copy("cleaned"))
-        self.btn_copy_raw.clicked.connect(lambda: self._copy("raw"))
-        self.btn_repaste.clicked.connect(self._repaste)
-        actions.addWidget(self.btn_copy_ai)
-        actions.addWidget(self.btn_copy_raw)
-        actions.addWidget(self.btn_repaste)
+        b_ai = QPushButton("复制 AI 版")
+        b_raw = QPushButton("复制原始")
+        b_re = QPushButton("重粘贴")
+        b_ai.clicked.connect(lambda: self._copy("cleaned"))
+        b_raw.clicked.connect(lambda: self._copy("raw"))
+        b_re.clicked.connect(self._repaste)
+        actions.addWidget(b_ai)
+        actions.addWidget(b_raw)
+        actions.addWidget(b_re)
         v.addLayout(actions)
 
+        self._refresh_status("loading")
         self._reload_list()
+
+    def _refresh_status(self, state: str):
+        msg = {
+            "idle":    "空闲 · 按住 {} 录音".format(HOTKEY),
+            "loading": "正在加载引擎...",
+            "rec":     "🔴 录音中...",
+            "proc":    "⏳ 处理中...",
+        }.get(state, state)
+        self.status.setText(
+            f"{msg}   |   引擎 {CONFIG['stt']['backend']} · "
+            f"AI {CONFIG['ai']['backend']} · 模板 {self.backend.current_prompt}"
+        )
+
+    def _on_state(self, state: str):
+        if state != "error":
+            self.err.hide()
+        self._refresh_status(state)
+
+    def _on_error(self, msg: str):
+        self.err.setText(f"⚠ {msg}")
+        self.err.show()
 
     def _reload_list(self):
         self.list.clear()
         for item in reversed(self.history):
-            preview = item["cleaned"][:40].replace("\n", " ")
-            label = f"{item['ts'][11:16]}  {item['duration']:>4}s  {preview}"
+            flag = "⚠ " if item.get("ai_failed") else ""
+            preview = item["cleaned"][:38].replace("\n", " ")
+            label = f"{item['ts'][11:16]}  {item['duration']:>4}s  {flag}{preview}"
             li = QListWidgetItem(label)
             li.setData(Qt.ItemDataRole.UserRole, item)
             self.list.addItem(li)
@@ -571,40 +715,31 @@ class HistoryPanel(QWidget):
         self.history = self.history[-MAX_HISTORY:]
         self._reload_list()
 
-    def _on_state(self, state: str):
-        msg = {
-            "idle":    "空闲 · 按住 CapsLock 录音",
-            "loading": "正在加载 Whisper 模型...",
-            "rec":     "🔴 录音中...",
-            "proc":    "⏳ 处理中（转写 + AI 清洗）...",
-        }
-        self.status.setText(msg.get(state, state))
-
-    def _selected_item(self):
+    def _selected(self):
         li = self.list.currentItem()
         return None if li is None else li.data(Qt.ItemDataRole.UserRole)
 
     def _on_select(self):
-        item = self._selected_item()
+        item = self._selected()
         if item is None:
             self.detail.clear()
             return
-        text = (
-            f"原始: {item['raw']}\n\n"
+        flag = "（AI 清洗失败，下为原始转写）\n" if item.get("ai_failed") else ""
+        self.detail.setPlainText(
+            f"{flag}原始: {item['raw']}\n\n"
             f"AI  : {item['cleaned']}\n\n"
-            f"耗时: STT {item['stt_sec']}s + AI {item['ai_sec']}s · 录音 {item['duration']}s"
+            f"耗时: STT {item['stt_sec']}s + AI {item['ai_sec']}s · "
+            f"录音 {item['duration']}s · 模板 {item.get('prompt', '-')}"
         )
-        self.detail.setPlainText(text)
 
     def _copy(self, key: str):
-        item = self._selected_item()
-        if item is None:
-            return
-        pyperclip.copy(item[key])
-        log(f"copied {key}")
+        item = self._selected()
+        if item:
+            pyperclip.copy(item[key])
+            log(f"copied {key}")
 
     def _repaste(self):
-        item = self._selected_item()
+        item = self._selected()
         if item is None:
             return
         self.hide()
@@ -623,15 +758,14 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     backend = Backend()
-    panel = HistoryPanel()
-    ball = FloatingBall(panel)
+    panel = HistoryPanel(backend)
+    ball = FloatingBall(panel, backend)
     ball.show()
+    ball.show_intro_if_needed()
 
-    # load model in background so UI is responsive immediately
     backend.start_async()
-
     app.aboutToQuit.connect(backend.stop)
-    log("UI ready, model loading in background")
+    log("UI ready, backend loading in background")
     sys.exit(app.exec())
 
 

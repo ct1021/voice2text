@@ -1,7 +1,17 @@
+# 核心依赖
 numpy
 pyperclip
 sounddevice
 keyboard
-faster-whisper
-claude-agent-sdk
 PyQt6
+
+# STT - faster-whisper 引擎（默认）
+faster-whisper
+
+# STT - SenseVoice 引擎（可选，仅 config [stt] backend=sensevoice 时需要）
+sherpa-onnx
+
+# AI 清洗后端
+claude-agent-sdk
+anthropic
+openai

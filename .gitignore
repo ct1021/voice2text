@@ -3,13 +3,14 @@
 __pycache__/
 *.pyc
 
-# Whisper models (large, auto-downloaded on first run)
+# Whisper / SenseVoice models (large, downloaded separately)
 models/
 
 # Runtime data & personal config (never commit)
 *.log
 history.jsonl
 ui_config.json
+config.toml
 glossary.txt
 .env
 

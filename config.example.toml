@@ -1,0 +1,55 @@
+# Voice2Text 配置文件
+# 首次启动会自动从本文件生成 config.toml。改配置请改 config.toml。
+
+[hotkey]
+# 录音热键：按住说话，松开转写。常见值: "caps lock" / "f13" / "right shift"
+key = "caps lock"
+
+[stt]
+# 语音识别引擎: faster-whisper | sensevoice
+backend = "faster-whisper"
+# faster-whisper 模型: tiny | base | small | medium | large-v3
+# 越大越准越慢；medium 适合 CPU。sensevoice 后端忽略此项。
+model = "medium"
+# 计算设备: cpu | cuda
+device = "cpu"
+# 识别语言
+language = "zh"
+
+[audio]
+# 麦克风设备名关键词，留空 = 系统默认输入设备
+device = ""
+sample_rate = 16000
+
+[ai]
+# AI 清洗后端:
+#   claude-sdk        = 走本机 Claude Code 订阅，免费，较慢(~8s)
+#   anthropic-api     = Anthropic API key，快，按量计费
+#   openai-compatible = OpenAI 兼容接口(DeepSeek/Qwen 等)，快，便宜
+#   none              = 不清洗，直接用原始转写
+backend = "claude-sdk"
+# 当前使用的 prompt 模板名，见 [ai.prompts]
+prompt = "default"
+
+[ai.anthropic]
+# anthropic-api 后端用。api_key 从环境变量读，这里填变量名
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-haiku-4-5-20251001"
+
+[ai.openai]
+# openai-compatible 后端用（默认填的是 DeepSeek）
+api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"
+
+[ai.prompts]
+# 多套清洗模板。[ai] 的 prompt 字段指定默认用哪个，托盘菜单可临时切换。
+default = "你是语音转写清洗专家。修正 ASR 转写错误（尤其技术专有名词），加合理标点，保持原意不增删。只输出清洗后的纯文本一行，不要解释。"
+requirement = "你是需求整理助手。把下面这段口述整理成 markdown 需求清单，每条以 - 开头，提炼要点、去掉口水话。只输出清单。"
+translate = "你是翻译助手。把下面这段中文翻译成自然流畅的英文。只输出译文。"
+
+[ui]
+# 悬浮球直径（像素）
+ball_size = 44
+# 是否总在最前
+always_on_top = true
