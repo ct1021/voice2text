@@ -2,8 +2,11 @@
 numpy
 pyperclip
 sounddevice
-keyboard
 PyQt6
+
+# 热键 - Windows 用 keyboard，macOS/Linux 用 pynput
+keyboard ; sys_platform == "win32"
+pynput ; sys_platform != "win32"
 
 # STT - faster-whisper 引擎（默认）
 faster-whisper

@@ -4,14 +4,13 @@
 
 ## 功能
 
-- **按住即说**：按住 CapsLock 录音，松开自动转写
+- **按住即说**：按住热键录音，松开自动转写
 - **AI 润色**：转写结果交给 AI 修正错别字、补标点、纠正专有名词
 - **自动粘贴**：润色后的文字直接出现在你光标所在的任何输入框
 - **桌面悬浮球**：颜色显示状态（灰＝空闲 / 红＝录音 / 橙＝处理 / 紫＝出错），可拖动
 - **历史面板**：单击小球查看所有历史，可重新粘贴任意一条
 - **多 AI 后端**：Claude 订阅 / Anthropic API / OpenAI 兼容（DeepSeek 等）/ 不清洗
-- **多 STT 引擎**：faster-whisper（默认）/ SenseVoice（更快的中文识别）
-- **清洗模板**：清洗 / 转需求清单 / 翻译，右键菜单随时切换
+- **多 STT 引擎**：faster-whisper（默认）/ SenseVoice
 - **个性化术语表**：把高频专有名词写进 `glossary.txt`，识别更准
 
 ## 工作原理
@@ -25,12 +24,14 @@
 
 ## 系统要求
 
-- Windows 10 / 11（Mac / Linux 暂未支持）
+- Windows 10 / 11，或 macOS
 - Python 3.11
 - Node.js（`claude-sdk` 后端需要）
 - 内存建议 16GB 以上
 
 ## 安装
+
+**Windows：**
 
 ```powershell
 git clone https://github.com/ct1021/voice2text.git
@@ -38,20 +39,34 @@ cd voice2text
 .\install.ps1
 ```
 
-`install.ps1` 会自动安装 uv、创建虚拟环境、装依赖、生成术语表。
+**macOS：**
+
+```bash
+git clone https://github.com/ct1021/voice2text.git
+cd voice2text
+chmod +x install.sh run.sh
+./install.sh
+```
+
+macOS 首次运行需在「系统设置 → 隐私与安全性 → 辅助功能」里授权运行的终端 / Python——全局热键依赖此权限。
+
 首次启动时会自动下载语音模型（约 1.5GB）。
 
 ## 使用
 
-1. 双击 `start.bat` 启动（或运行 `.\run.ps1`）
+1. 启动：Windows 双击 `start.bat`；macOS 运行 `./run.sh`
 2. 桌面出现悬浮小球，把光标放到任何输入框
-3. **按住 CapsLock** 说话，**松开** 结束
+3. **按住热键** 说话，**松开** 结束
 4. 等几秒，润色后的文字自动粘贴
 5. **单击小球** 打开历史面板；**右键小球** 打开菜单
+
+默认热键：Windows 为 CapsLock；macOS 建议在 `config.toml` 改成 `right cmd` 或 `right option`（见下）。
 
 ## 配置
 
 所有设置在 `config.toml`（首次启动自动从 `config.example.toml` 生成）。
+
+**录音热键** —— `[hotkey] key`。Windows 用 CapsLock 即可；macOS 上 pynput 不抑制按键，需用按下无副作用的键（右 Cmd / 右 Option）。
 
 **换 AI 后端** —— 没有 Claude 订阅？用 DeepSeek 等 OpenAI 兼容接口：
 
@@ -60,16 +75,9 @@ cd voice2text
 backend = "openai-compatible"
 ```
 
-然后设好环境变量 `DEEPSEEK_API_KEY`（密钥名在 `[ai.openai]` 配）。
+然后设好环境变量 `DEEPSEEK_API_KEY`。
 
-**换 STT 引擎** —— 想要更快更准的中文识别：
-
-```toml
-[stt]
-backend = "sensevoice"
-```
-
-**清洗模板** —— `[ai.prompts]` 里预设了「清洗 / 转需求清单 / 翻译」，右键小球可临时切换。
+**换 STT 引擎** —— 想要更快更准的中文识别，设 `[stt] backend = "sensevoice"`（模型需手动下载，见下）。
 
 **个性化术语表** —— 编辑 `glossary.txt`，把你工作中的人名、产品名、技术栈加进去。
 
@@ -83,9 +91,9 @@ SenseVoice 中文识别更快更准，但模型需手动下载：
 
 ## 已知限制
 
-- `claude-sdk` 后端每次清洗约 7–10 秒（子进程启动开销）；用 API 后端更快
-- 脚本运行期间 CapsLock 被用作录音键，不能切大写
-- 目前仅在 Windows 上测试过
+- `claude-sdk` 后端每次清洗约 7–10 秒；用 API 后端更快
+- 运行期间，作为热键的按键会被占用（Windows 上 CapsLock 不能切大写）
+- macOS 支持为新增，作者主力在 Windows 测试，Mac 上如遇问题欢迎提 issue
 
 ## License
 

@@ -38,7 +38,6 @@ if sys.platform == "win32":
 import numpy as np
 import pyperclip
 import sounddevice as sd
-import keyboard as kb
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor, QAction
@@ -50,6 +49,7 @@ from PyQt6.QtWidgets import (
 from config import load_config
 from stt import make_engine
 from ai import make_cleaner, NoOpCleaner
+from hotkey import make_hotkey, send_paste
 
 # ===== Config =====
 CONFIG = load_config()
@@ -93,15 +93,19 @@ def log(msg: str) -> None:
 
 
 def beep(ok: bool = True) -> None:
-    """Feedback sound. Windows only; silent elsewhere (Mac/Linux TODO)."""
-    if sys.platform == "win32":
-        try:
+    """Feedback sound. Windows: winsound; macOS: afplay; Linux: silent."""
+    try:
+        if sys.platform == "win32":
             import winsound
             winsound.MessageBeep(
                 winsound.MB_OK if ok else winsound.MB_ICONEXCLAMATION
             )
-        except Exception:
-            pass
+        elif sys.platform == "darwin":
+            sound = ("/System/Library/Sounds/Glass.aiff" if ok
+                     else "/System/Library/Sounds/Basso.aiff")
+            subprocess.Popen(["afplay", sound])
+    except Exception:
+        pass
 
 
 # ===== UI config (ball position, intro flag) =====
@@ -152,7 +156,6 @@ class Bus(QObject):
     state = pyqtSignal(str)            # idle | loading | rec | proc
     history_added = pyqtSignal(dict)
     error = pyqtSignal(str)
-    prompt_changed = pyqtSignal(str)
 
 
 bus = Bus()
@@ -175,8 +178,8 @@ class Backend:
         self.engine = None
         self.cleaner = None
         self.stream = None
+        self.hotkey = None
         self.ready = False
-        self.current_prompt = CONFIG["ai"]["prompt"]
 
     def start_async(self):
         threading.Thread(target=self._init, daemon=True).start()
@@ -223,8 +226,8 @@ class Backend:
             bus.error.emit(f"麦克风打开失败: {e}")
             return
         try:
-            kb.on_press_key(HOTKEY, self._on_press, suppress=True)
-            kb.on_release_key(HOTKEY, self._on_release, suppress=True)
+            self.hotkey = make_hotkey(HOTKEY, self._on_press, self._on_release)
+            self.hotkey.start()
         except Exception as e:
             log(f"hotkey failed: {e}")
             bus.error.emit(f"热键 '{HOTKEY}' 注册失败: {e}")
@@ -233,21 +236,15 @@ class Backend:
         bus.state.emit("idle")
         log(f"backend ready - hold {HOTKEY} to dictate")
 
-    def set_prompt(self, name: str):
-        self.current_prompt = name
-        bus.prompt_changed.emit(name)
-        log(f"prompt template -> {name}")
-
     def _system_prompt(self) -> str:
-        prompts = CONFIG["ai"]["prompts"]
-        template = prompts.get(self.current_prompt) or prompts.get("default", "")
+        template = CONFIG["ai"]["prompts"].get("default", "")
         return f"{template}\n\n专有名词参考词典：\n{GLOSSARY}"
 
     def _audio_cb(self, indata, frames, time_info, status):
         if self.recording:
             self.audio_q.put(indata.copy())
 
-    def _on_press(self, _e):
+    def _on_press(self):
         if self.recording:
             return
         if not self.ready:
@@ -265,7 +262,7 @@ class Backend:
         log("REC start")
         bus.state.emit("rec")
 
-    def _on_release(self, _e):
+    def _on_release(self):
         if not self.recording:
             return
         self.recording = False
@@ -318,7 +315,7 @@ class Backend:
                 cleaned = raw
             pyperclip.copy(cleaned)
             time.sleep(0.08)
-            kb.send("ctrl+v")
+            send_paste()
             beep(ok=True)
             item = {
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -327,7 +324,6 @@ class Backend:
                 "ai_sec": round(ai_sec, 2),
                 "raw": raw,
                 "cleaned": cleaned,
-                "prompt": self.current_prompt,
                 "ai_failed": ai_failed,
             }
             append_history(item)
@@ -342,7 +338,8 @@ class Backend:
 
     def stop(self):
         try:
-            kb.unhook_all()
+            if self.hotkey:
+                self.hotkey.stop()
         except Exception:
             pass
         try:
@@ -534,16 +531,6 @@ class FloatingBall(QWidget):
         a_hist = QAction("显示历史", self)
         a_hist.triggered.connect(self._toggle_panel)
         menu.addAction(a_hist)
-
-        sub = menu.addMenu("清洗模板")
-        for name in CONFIG["ai"]["prompts"]:
-            mark = "  ✓" if name == self.backend.current_prompt else ""
-            act = QAction(f"{name}{mark}", self)
-            act.triggered.connect(
-                lambda _checked=False, n=name: self.backend.set_prompt(n)
-            )
-            sub.addAction(act)
-
         menu.addSeparator()
         import os
         a_log = QAction("打开日志", self)
@@ -584,7 +571,6 @@ class HistoryPanel(QWidget):
         bus.history_added.connect(self._on_added)
         bus.state.connect(self._on_state)
         bus.error.connect(self._on_error)
-        bus.prompt_changed.connect(lambda _n: self._refresh_status("idle"))
         self.hide()
 
     def _build_ui(self):
@@ -688,7 +674,7 @@ class HistoryPanel(QWidget):
         }.get(state, state)
         self.status.setText(
             f"{msg}   |   引擎 {CONFIG['stt']['backend']} · "
-            f"AI {CONFIG['ai']['backend']} · 模板 {self.backend.current_prompt}"
+            f"AI {CONFIG['ai']['backend']}"
         )
 
     def _on_state(self, state: str):
@@ -729,7 +715,7 @@ class HistoryPanel(QWidget):
             f"{flag}原始: {item['raw']}\n\n"
             f"AI  : {item['cleaned']}\n\n"
             f"耗时: STT {item['stt_sec']}s + AI {item['ai_sec']}s · "
-            f"录音 {item['duration']}s · 模板 {item.get('prompt', '-')}"
+            f"录音 {item['duration']}s"
         )
 
     def _copy(self, key: str):
@@ -748,7 +734,7 @@ class HistoryPanel(QWidget):
     def _do_paste(self, text: str):
         pyperclip.copy(text)
         time.sleep(0.06)
-        kb.send("ctrl+v")
+        send_paste()
         log("re-pasted")
 
 
