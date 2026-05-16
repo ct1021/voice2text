@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Whisper models (large, auto-downloaded on first run)
+models/
+
+# Runtime data & personal config (never commit)
+*.log
+history.jsonl
+ui_config.json
+glossary.txt
+.env
+
+# Dev / backup artifacts
+voice2text_v1_tray.py
+test_sdk.py
+test_result.txt
+prewarm.py

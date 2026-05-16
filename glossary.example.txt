@@ -1,0 +1,20 @@
+# Voice2Text 个性化术语表（示例）
+#
+# 使用方法：把本文件复制为 glossary.txt，然后改成你自己的常用词。
+#     copy glossary.example.txt glossary.txt
+#
+# 规则：
+#   - 每行一个词，或一行多个用逗号分隔
+#   - # 开头的行是注释
+#   - glossary.txt 已被 .gitignore 排除，是你的私人配置，不会上传
+#
+# 这些词会注入语音识别和 AI 清洗环节，显著提高专有名词的转写准确率。
+# 把你工作里高频出现、又容易被听错的词都加进来：人名、产品名、技术栈、缩写。
+
+# 示例：技术栈
+Claude Code, Claude, ChatGPT, Codex, Cursor, GitHub, Git,
+Python, JavaScript, TypeScript, Node.js, Docker, WSL, PowerShell,
+faster-whisper, SenseVoice, Whisper, API, SDK, MCP, LLM
+
+# 示例：把你自己的专有名词加在下面
+# 项目代号, 同事名字, 产品名, ...

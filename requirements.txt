@@ -1,0 +1,7 @@
+numpy
+pyperclip
+sounddevice
+keyboard
+faster-whisper
+claude-agent-sdk
+PyQt6
