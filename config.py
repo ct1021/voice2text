@@ -1,4 +1,5 @@
 """Config loading: read config.toml, auto-generate from example on first run."""
+import os
 import tomllib
 from pathlib import Path
 
@@ -50,11 +51,32 @@ def _merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from .env into os.environ (existing vars win)."""
+    env_file = APP_DIR / ".env"
+    if not env_file.exists():
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception:
+        pass
+
+
 def load_config() -> dict:
     """Load config.toml, creating it from config.example.toml if absent.
 
-    Any missing key falls back to DEFAULTS, so callers can index freely.
+    Also loads .env into os.environ. Missing config keys fall back to
+    DEFAULTS, so callers can index freely.
     """
+    _load_dotenv()
     if not CONFIG_FILE.exists() and EXAMPLE_FILE.exists():
         try:
             CONFIG_FILE.write_text(
