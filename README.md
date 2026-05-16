@@ -33,7 +33,7 @@
 
 ```powershell
 # 1. 克隆仓库
-git clone https://github.com/<your-name>/voice2text.git
+git clone https://github.com/ct1021/voice2text.git
 cd voice2text
 
 # 2. 建虚拟环境并装依赖
