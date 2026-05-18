@@ -50,11 +50,10 @@ from PyQt6.QtWidgets import (
 from config import load_config
 from stt import make_engine
 from ai import make_cleaner, NoOpCleaner
-from hotkey import make_hotkey, send_paste
+from hotkey import make_hotkey, send_paste, capture_key
 
 # ===== Config =====
 CONFIG = load_config()
-HOTKEY = CONFIG["hotkey"]["key"]
 SAMPLE_RATE = CONFIG["audio"]["sample_rate"]
 MIN_DURATION_SEC = 0.3
 MAX_DURATION_SEC = 300
@@ -63,6 +62,17 @@ DEMO = bool(CONFIG["ui"].get("demo_mode", False))  # 录视频演示模式
 
 HISTORY_FILE = APP_DIR / "history.jsonl"
 UI_CONFIG_FILE = APP_DIR / "ui_config.json"
+
+# 「性格设置」(录音热键等) 存在 ui_config.json，启动时覆盖 config.toml。
+# config.toml 只保留 STT/AI 后端、模型、API key 等硬配置。
+if UI_CONFIG_FILE.exists():
+    try:
+        _uic = json.loads(UI_CONFIG_FILE.read_text(encoding="utf-8"))
+        if _uic.get("hotkey"):
+            CONFIG["hotkey"]["key"] = _uic["hotkey"]
+    except Exception:
+        pass
+HOTKEY = CONFIG["hotkey"]["key"]
 
 # ===== Glossary =====
 DEFAULT_GLOSSARY = (
@@ -196,6 +206,7 @@ class Backend:
         self.cleaner = None
         self.stream = None
         self.hotkey = None
+        self.hotkey_key = HOTKEY  # 当前录音热键，可运行时切换
         self.ready = False
         self.prompt_mode = "default"  # 对应 config [ai.prompts] 的键
 
@@ -244,15 +255,35 @@ class Backend:
             bus.error.emit(f"麦克风打开失败: {e}")
             return
         try:
-            self.hotkey = make_hotkey(HOTKEY, self._on_press, self._on_release)
+            self.hotkey = make_hotkey(
+                self.hotkey_key, self._on_press, self._on_release
+            )
             self.hotkey.start()
         except Exception as e:
             log(f"hotkey failed: {e}")
-            bus.error.emit(f"热键 '{HOTKEY}' 注册失败: {e}")
+            bus.error.emit(f"热键 '{self.hotkey_key}' 注册失败: {e}")
             return
         self.ready = True
         bus.state.emit("idle")
-        log(f"backend ready - hold {HOTKEY} to dictate")
+        log(f"backend ready - hold {self.hotkey_key} to dictate")
+
+    def set_hotkey(self, key: str) -> bool:
+        """运行时切换录音热键：停掉旧的，注册新的。即时生效。"""
+        try:
+            if self.hotkey:
+                self.hotkey.stop()
+        except Exception:
+            pass
+        self.hotkey_key = key
+        try:
+            self.hotkey = make_hotkey(key, self._on_press, self._on_release)
+            self.hotkey.start()
+            log(f"hotkey changed -> {key}")
+            return True
+        except Exception as e:
+            log(f"hotkey re-register failed: {e}")
+            bus.error.emit(f"热键 '{key}' 注册失败: {e}")
+            return False
 
     def _system_prompt(self) -> str:
         prompts = CONFIG["ai"]["prompts"]
@@ -411,6 +442,116 @@ class IntroBubble(QWidget):
         self.move(x, max(0, ball.y() - 30))
         self.show()
         QTimer.singleShot(9000, self.close)
+
+
+# ===== Hotkey capture dialog =====
+class HotkeyDialog(QWidget):
+    """自定义录音热键：按下任意键即捕获，确定后即时生效，存进 ui_config.json。"""
+
+    captured = pyqtSignal(str)
+
+    def __init__(self, backend: Backend, ball: QWidget):
+        super().__init__()
+        self.backend = backend
+        self.old_key = backend.hotkey_key
+        self.new_key = None
+        self._applied = False
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.resize(340, 168)
+        frame = QFrame(self)
+        frame.setGeometry(0, 0, 340, 168)
+        frame.setStyleSheet("""
+            QFrame {
+                background-color: rgba(32, 32, 38, 250);
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 40);
+            }
+            QLabel { color: #eee; font-size: 13px; }
+            QPushButton {
+                background: rgba(255,255,255,22); color: #ddd;
+                border: 1px solid rgba(255,255,255,30); border-radius: 5px;
+                padding: 6px 10px; font-size: 12px;
+            }
+            QPushButton:hover { background: rgba(255,255,255,42); }
+            QPushButton:disabled { color: #777; }
+        """)
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("设置录音热键")
+        title.setStyleSheet("font-weight: bold; font-size: 14px; color:#fff;")
+        lay.addWidget(title)
+        self.label = QLabel("")
+        self.label.setWordWrap(True)
+        lay.addWidget(self.label)
+        lay.addStretch()
+        btns = QHBoxLayout()
+        self.ok_btn = QPushButton("确定用它")
+        self.re_btn = QPushButton("重按")
+        cancel = QPushButton("取消")
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.clicked.connect(self._confirm)
+        self.re_btn.clicked.connect(self._recapture)
+        cancel.clicked.connect(self.close)
+        btns.addWidget(self.ok_btn)
+        btns.addWidget(self.re_btn)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        self.captured.connect(self._on_captured)
+        self.move(max(20, ball.x() - 360), max(20, ball.y() - 40))
+        self._start_capture()
+
+    def _start_capture(self):
+        self.label.setText(f"当前：{self.old_key}\n\n请按下你想用的键（按住即录音的键）…")
+        self.ok_btn.setEnabled(False)
+        try:
+            if self.backend.hotkey:
+                self.backend.hotkey.stop()  # 暂停旧热键，避免干扰捕获
+        except Exception:
+            pass
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        key = capture_key()
+        self.captured.emit(key or "")
+
+    def _on_captured(self, key: str):
+        if not key:
+            self.label.setText("没捕获到，点「重按」再试一次。")
+            return
+        self.new_key = key
+        self.label.setText(
+            f"捕获到：【{key}】\n\n以后按住这个键说话。确定，还是重按？"
+        )
+        self.ok_btn.setEnabled(True)
+
+    def _recapture(self):
+        self.new_key = None
+        self._start_capture()
+
+    def _confirm(self):
+        if not self.new_key:
+            return
+        global HOTKEY
+        uic = load_ui_config()
+        uic["hotkey"] = self.new_key
+        save_ui_config(uic)
+        self.backend.set_hotkey(self.new_key)
+        HOTKEY = self.new_key
+        self._applied = True
+        self.close()
+
+    def closeEvent(self, e):
+        if not self._applied:
+            # 没确认就关闭 —— 恢复原热键（捕获时已停掉它）
+            self.backend.set_hotkey(self.old_key)
+        super().closeEvent(e)
 
 
 # ===== Floating ball =====
@@ -579,6 +720,10 @@ class FloatingBall(QWidget):
             )
             mode_menu.addAction(act)
 
+        a_key = QAction("设置录音热键…", self)
+        a_key.triggered.connect(self._open_hotkey_dialog)
+        menu.addAction(a_key)
+
         menu.addSeparator()
         import os
         a_log = QAction("打开日志", self)
@@ -597,6 +742,12 @@ class FloatingBall(QWidget):
         a_quit.triggered.connect(QApplication.quit)
         menu.addAction(a_quit)
         menu.exec(pos)
+
+    def _open_hotkey_dialog(self):
+        self._hk_dialog = HotkeyDialog(self.backend, self)
+        self._hk_dialog.show()
+        self._hk_dialog.raise_()
+        self._hk_dialog.activateWindow()
 
 
 # ===== History panel =====

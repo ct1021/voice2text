@@ -82,12 +82,15 @@ class _PynputHotkey(HotkeyListener):
 
     def _resolve(self, name: str):
         from pynput.keyboard import Key, KeyCode
-        attr = _PYNPUT_KEYS.get(name.lower().strip())
+        raw = name.strip()
+        attr = _PYNPUT_KEYS.get(raw.lower())
         if attr and hasattr(Key, attr):
             return getattr(Key, attr)
-        cleaned = name.strip()
-        if len(cleaned) == 1:
-            return KeyCode.from_char(cleaned)
+        # 捕获得到的 pynput 名（caps_lock / ctrl_r / f8 …）直接解析
+        if hasattr(Key, raw.lower()):
+            return getattr(Key, raw.lower())
+        if len(raw) == 1:
+            return KeyCode.from_char(raw)
         # default to right option if unrecognized
         return Key.alt_r
 
@@ -124,3 +127,34 @@ def make_hotkey(key_name: str, on_press, on_release) -> HotkeyListener:
     if sys.platform == "win32":
         return _WindowsHotkey(key_name, on_press, on_release)
     return _PynputHotkey(key_name, on_press, on_release)
+
+
+def capture_key():
+    """阻塞直到用户按下一个键，返回键名（可直接传给 make_hotkey）。失败返回 None。
+
+    用于「自定义录音热键」——调用前应先停掉当前热键监听，避免互相干扰。
+    """
+    try:
+        if sys.platform == "win32":
+            import keyboard
+            while True:
+                ev = keyboard.read_event(suppress=False)
+                if ev.event_type == "down" and ev.name:
+                    return ev.name
+        else:
+            from pynput import keyboard as pk
+            from pynput.keyboard import Key, KeyCode
+            holder: dict = {}
+
+            def _on(key):
+                if isinstance(key, Key):
+                    holder["name"] = key.name
+                elif isinstance(key, KeyCode) and key.char:
+                    holder["name"] = key.char
+                return False  # 抓到第一个就停
+
+            with pk.Listener(on_press=_on) as lis:
+                lis.join()
+            return holder.get("name")
+    except Exception:
+        return None

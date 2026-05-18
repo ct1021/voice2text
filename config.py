@@ -12,7 +12,7 @@ EXAMPLE_FILE = APP_DIR / "config.example.toml"
 DEFAULTS = {
     "hotkey": {"key": "caps lock"},
     "stt": {
-        "backend": "faster-whisper",
+        "backend": "sensevoice",
         "model": "medium",
         "device": "cpu",
         "language": "zh",
