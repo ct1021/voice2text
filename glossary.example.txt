@@ -12,7 +12,7 @@
 # 把你工作里高频出现、又容易被听错的词都加进来：人名、产品名、技术栈、缩写。
 
 # 示例：技术栈
-Claude Code, Claude, ChatGPT, Codex, Cursor, GitHub, Git,
+voice2text, Voice2Text, Claude Code, Claude, ChatGPT, Codex, Cursor, GitHub, Git,
 Python, JavaScript, TypeScript, Node.js, Docker, WSL, PowerShell,
 faster-whisper, SenseVoice, Whisper, API, SDK, MCP, LLM
 

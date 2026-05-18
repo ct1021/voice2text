@@ -79,6 +79,122 @@ class SenseVoiceEngine(STTEngine):
         return stream.result.text.strip()
 
 
+class VolcengineEngine(STTEngine):
+    """火山引擎大模型录音文件识别标准版（云端）。
+
+    submit 提交任务 + query 轮询结果两步；音频会上传到火山云端。
+    凭证从 .env 读（VOLC_ASR_APP_ID / VOLC_ASR_ACCESS_TOKEN）。
+    """
+
+    SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
+    QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+
+    def __init__(self, app_id_env: str = "VOLC_ASR_APP_ID",
+                 access_token_env: str = "VOLC_ASR_ACCESS_TOKEN",
+                 resource_id: str = "volc.bigasr.auc"):
+        import os
+        self._app_id = os.environ.get(app_id_env, "").strip()
+        self._access_token = os.environ.get(access_token_env, "").strip()
+        if not self._app_id or not self._access_token:
+            raise RuntimeError(
+                f"火山引擎凭证缺失：请在 .env 设置 {app_id_env} 与 {access_token_env}"
+            )
+        self._resource_id = resource_id
+
+    @staticmethod
+    def _to_wav_bytes(audio: np.ndarray) -> bytes:
+        """float32 [-1,1] mono 16k -> 16-bit PCM WAV 字节串。"""
+        import io
+        import wave
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(pcm.tobytes())
+        return buf.getvalue()
+
+    def _post(self, url: str, headers: dict, payload: dict):
+        """POST JSON，返回 (响应头对象, 响应体文本)。"""
+        import json
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.headers, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "ignore")[:300]
+            raise RuntimeError(f"火山引擎 HTTP {e.code}: {detail}")
+        except Exception as e:
+            raise RuntimeError(f"火山引擎请求失败: {e}")
+
+    def _auth_headers(self, task_id: str) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "X-Api-App-Key": self._app_id,
+            "X-Api-Access-Key": self._access_token,
+            "X-Api-Resource-Id": self._resource_id,
+            "X-Api-Request-Id": task_id,
+        }
+
+    def transcribe(self, audio: np.ndarray, glossary: str) -> str:
+        # glossary 不在此处使用；云端识别后由下游 AI 清洗纠正术语。
+        import base64
+        import json
+        import time
+        import uuid
+
+        audio_b64 = base64.b64encode(self._to_wav_bytes(audio)).decode()
+        task_id = str(uuid.uuid4())
+
+        # 1) 提交任务
+        submit_headers = self._auth_headers(task_id)
+        submit_headers["X-Api-Sequence"] = "-1"
+        submit_body = {
+            "user": {"uid": self._app_id},
+            "audio": {"format": "wav", "rate": 16000, "data": audio_b64},
+            "request": {
+                "model_name": "bigmodel",
+                "enable_itn": True,
+                "enable_punc": True,
+            },
+        }
+        hdrs, _ = self._post(self.SUBMIT_URL, submit_headers, submit_body)
+        code = hdrs.get("X-Api-Status-Code", "")
+        if code != "20000000":
+            raise RuntimeError(
+                f"火山引擎 submit 失败 (status={code}): "
+                f"{hdrs.get('X-Api-Message', '')}"
+            )
+        logid = hdrs.get("X-Tt-Logid", "")
+
+        # 2) 轮询结果（短音频通常几秒内完成）
+        query_headers = self._auth_headers(task_id)
+        query_headers["X-Tt-Logid"] = logid
+        for _ in range(60):
+            hdrs, raw = self._post(self.QUERY_URL, query_headers, {})
+            code = hdrs.get("X-Api-Status-Code", "")
+            if code == "20000000":
+                body = json.loads(raw) if raw.strip() else {}
+                result = body.get("result") or {}
+                return (result.get("text") or "").strip()
+            if code == "20000003":
+                return ""  # 无有效语音（静音 / 太短）
+            if code in ("20000001", "20000002"):
+                time.sleep(0.5)
+                continue
+            raise RuntimeError(
+                f"火山引擎 query 失败 (status={code}): "
+                f"{hdrs.get('X-Api-Message', '')}"
+            )
+        raise RuntimeError("火山引擎 query 轮询超时")
+
+
 def make_engine(stt_config: dict) -> STTEngine:
     """Build the STT engine described by config [stt]. May raise on bad config."""
     backend = stt_config.get("backend", "faster-whisper")
@@ -91,4 +207,11 @@ def make_engine(stt_config: dict) -> STTEngine:
         )
     if backend == "sensevoice":
         return SenseVoiceEngine(language=language)
+    if backend == "volcengine":
+        v = stt_config.get("volcengine", {})
+        return VolcengineEngine(
+            app_id_env=v.get("app_id_env", "VOLC_ASR_APP_ID"),
+            access_token_env=v.get("access_token_env", "VOLC_ASR_ACCESS_TOKEN"),
+            resource_id=v.get("resource_id", "volc.bigasr.auc"),
+        )
     raise ValueError(f"未知 STT 后端: {backend}")

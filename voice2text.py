@@ -40,7 +40,7 @@ import pyperclip
 import sounddevice as sd
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
-from PyQt6.QtGui import QPainter, QColor, QAction
+from PyQt6.QtGui import QPainter, QColor, QAction, QFont, QActionGroup
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QListWidget,
     QListWidgetItem, QLabel, QPushButton, QTextEdit, QMenu, QFrame,
@@ -59,15 +59,17 @@ SAMPLE_RATE = CONFIG["audio"]["sample_rate"]
 MIN_DURATION_SEC = 0.3
 MAX_DURATION_SEC = 300
 MAX_HISTORY = 100
+DEMO = bool(CONFIG["ui"].get("demo_mode", False))  # 录视频演示模式
 
 HISTORY_FILE = APP_DIR / "history.jsonl"
 UI_CONFIG_FILE = APP_DIR / "ui_config.json"
 
 # ===== Glossary =====
 DEFAULT_GLOSSARY = (
-    "Claude Code, Claude, ChatGPT, Codex, Cursor, GitHub, Git, "
-    "Python, JavaScript, TypeScript, Node.js, Docker, WSL, PowerShell, "
-    "API, SDK, MCP, LLM, faster-whisper, SenseVoice, Whisper"
+    "voice2text, Voice2Text, Claude Code, Claude, ChatGPT, Codex, "
+    "Cursor, GitHub, Git, Python, JavaScript, TypeScript, Node.js, "
+    "Docker, WSL, PowerShell, API, SDK, MCP, LLM, "
+    "faster-whisper, SenseVoice, Whisper"
 )
 
 
@@ -175,6 +177,14 @@ COLORS = {
     "error":   QColor(155, 89, 182),
 }
 
+# 演示模式：球上显示的状态文字
+STATE_LABELS = {
+    "idle": "空闲", "loading": "载入", "rec": "录音",
+    "proc": "处理", "error": "出错",
+}
+# 右键菜单「整理模式」标签
+PROMPT_LABELS = {"default": "默认清洗", "markdown": "整理成 Markdown"}
+
 
 # ===== Backend =====
 class Backend:
@@ -187,6 +197,7 @@ class Backend:
         self.stream = None
         self.hotkey = None
         self.ready = False
+        self.prompt_mode = "default"  # 对应 config [ai.prompts] 的键
 
     def start_async(self):
         threading.Thread(target=self._init, daemon=True).start()
@@ -244,7 +255,8 @@ class Backend:
         log(f"backend ready - hold {HOTKEY} to dictate")
 
     def _system_prompt(self) -> str:
-        template = CONFIG["ai"]["prompts"].get("default", "")
+        prompts = CONFIG["ai"]["prompts"]
+        template = prompts.get(self.prompt_mode) or prompts.get("default", "")
         return f"{template}\n\n专有名词参考词典：\n{GLOSSARY}"
 
     def _audio_cb(self, indata, frames, time_info, status):
@@ -407,7 +419,8 @@ class FloatingBall(QWidget):
         super().__init__()
         self.panel = panel
         self.backend = backend
-        self.size_px = CONFIG["ui"]["ball_size"]
+        self.size_px = (CONFIG["ui"].get("ball_size_demo", 80) if DEMO
+                        else CONFIG["ui"]["ball_size"])
         self.state = "loading"
         self.drag_offset = None
         self._moved = False
@@ -426,7 +439,8 @@ class FloatingBall(QWidget):
             self.move(self.ui_cfg["ball_x"], self.ui_cfg["ball_y"])
         else:
             scr = QApplication.primaryScreen().availableGeometry()
-            self.move(scr.right() - 80, scr.bottom() - 200)
+            self.move(scr.right() - self.size_px - 36,
+                      scr.bottom() - self.size_px - 140)
 
         bus.state.connect(self._on_state)
         bus.error.connect(self._on_error)
@@ -466,6 +480,15 @@ class FloatingBall(QWidget):
         p.drawEllipse(8, 8, self.size_px - 16, self.size_px - 16)
         p.setBrush(QColor(255, 255, 255, 230))
         p.drawEllipse(18, 18, self.size_px - 36, self.size_px - 36)
+        if DEMO:
+            label = STATE_LABELS.get(self.state, "")
+            if label:
+                font = QFont()
+                font.setPixelSize(max(14, self.size_px // 5))
+                font.setBold(True)
+                p.setFont(font)
+                p.setPen(color)
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, label)
 
     def _set_state(self, state: str):
         self.state = state
@@ -542,6 +565,20 @@ class FloatingBall(QWidget):
         a_hist = QAction("显示历史", self)
         a_hist.triggered.connect(self._toggle_panel)
         menu.addAction(a_hist)
+
+        mode_menu = menu.addMenu("整理模式")
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+        for key in CONFIG["ai"]["prompts"]:
+            act = QAction(PROMPT_LABELS.get(key, key), self)
+            act.setCheckable(True)
+            act.setChecked(self.backend.prompt_mode == key)
+            grp.addAction(act)
+            act.triggered.connect(
+                lambda _c=False, k=key: setattr(self.backend, "prompt_mode", k)
+            )
+            mode_menu.addAction(act)
+
         menu.addSeparator()
         import os
         a_log = QAction("打开日志", self)
@@ -570,6 +607,8 @@ class HistoryPanel(QWidget):
     def __init__(self, backend: Backend):
         super().__init__()
         self.backend = backend
+        self.WIDTH = 560 if DEMO else 440
+        self.HEIGHT = 620 if DEMO else 500
         self.history = load_history()
         save_history(self.history)  # rewrite-truncate any oversized old file
         self.setWindowFlags(
@@ -588,22 +627,28 @@ class HistoryPanel(QWidget):
     def _build_ui(self):
         frame = QFrame(self)
         frame.setGeometry(0, 0, self.WIDTH, self.HEIGHT)
+        if DEMO:
+            z = {"body": 19, "title": 22, "small": 16,
+                 "list": 18, "btn": 16, "close": 24, "pad": 11}
+        else:
+            z = {"body": 13, "title": 15, "small": 11,
+                 "list": 12, "btn": 11, "close": 18, "pad": 7}
         frame.setStyleSheet("""
             QFrame {
                 background-color: rgba(28, 28, 32, 245);
                 border-radius: 14px;
                 border: 1px solid rgba(255, 255, 255, 30);
             }
-            QLabel { color: #ddd; font-size: 13px; }
-            QLabel#title { color: #fff; font-size: 15px; font-weight: bold; }
-            QLabel#status { color: #aaa; font-size: 11px; }
-            QLabel#err { color: #e8a0c8; font-size: 11px; }
+            QLabel { color: #ddd; font-size: %(body)dpx; }
+            QLabel#title { color: #fff; font-size: %(title)dpx; font-weight: bold; }
+            QLabel#status { color: #aaa; font-size: %(small)dpx; }
+            QLabel#err { color: #e8a0c8; font-size: %(small)dpx; }
             QListWidget {
                 background: transparent; border: none; color: #ddd;
-                font-size: 12px; outline: none;
+                font-size: %(list)dpx; outline: none;
             }
             QListWidget::item {
-                padding: 7px 4px;
+                padding: %(pad)dpx 4px;
                 border-bottom: 1px solid rgba(255,255,255,12);
             }
             QListWidget::item:selected {
@@ -613,20 +658,20 @@ class HistoryPanel(QWidget):
             QTextEdit {
                 background: rgba(0, 0, 0, 80); color: #ddd;
                 border: 1px solid rgba(255,255,255,22);
-                border-radius: 6px; font-size: 12px; padding: 6px;
+                border-radius: 6px; font-size: %(list)dpx; padding: 6px;
             }
             QPushButton {
                 background: rgba(255, 255, 255, 22); color: #ddd;
                 border: 1px solid rgba(255,255,255,30); border-radius: 5px;
-                padding: 5px 10px; font-size: 11px;
+                padding: 5px 10px; font-size: %(btn)dpx;
             }
             QPushButton:hover { background: rgba(255, 255, 255, 42); }
             QPushButton#close {
                 background: transparent; border: none;
-                color: #aaa; font-size: 18px; padding: 0;
+                color: #aaa; font-size: %(close)dpx; padding: 0;
             }
             QPushButton#close:hover { color: #fff; }
-        """)
+        """ % z)
         v = QVBoxLayout(frame)
         v.setContentsMargins(14, 12, 14, 12)
         v.setSpacing(7)
@@ -638,7 +683,7 @@ class HistoryPanel(QWidget):
         head.addStretch()
         close_btn = QPushButton("×")
         close_btn.setObjectName("close")
-        close_btn.setFixedSize(26, 26)
+        close_btn.setFixedSize(34 if DEMO else 26, 34 if DEMO else 26)
         close_btn.clicked.connect(self.hide)
         head.addWidget(close_btn)
         v.addLayout(head)
@@ -659,7 +704,7 @@ class HistoryPanel(QWidget):
 
         self.detail = QTextEdit()
         self.detail.setReadOnly(True)
-        self.detail.setMaximumHeight(120)
+        self.detail.setMaximumHeight(170 if DEMO else 120)
         v.addWidget(self.detail, 1)
 
         actions = QHBoxLayout()

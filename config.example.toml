@@ -9,15 +9,26 @@
 key = "caps lock"
 
 [stt]
-# 语音识别引擎: faster-whisper | sensevoice
+# 语音识别引擎: faster-whisper | sensevoice | volcengine
+#   faster-whisper = 本地，默认，纯 CPU 较慢
+#   sensevoice     = 本地，更快更准的中文（模型需手动下载，见 README）
+#   volcengine     = 火山引擎云端，最快，但音频会上传云端（凭证填 .env）
 backend = "faster-whisper"
 # faster-whisper 模型: tiny | base | small | medium | large-v3
-# 越大越准越慢；medium 适合 CPU。sensevoice 后端忽略此项。
+# 越大越准越慢；medium 适合 CPU。其它后端忽略此项。
 model = "medium"
 # 计算设备: cpu | cuda
 device = "cpu"
 # 识别语言
 language = "zh"
+
+[stt.volcengine]
+# 火山引擎语音识别（backend = "volcengine" 时用）。
+# 凭证填在 .env：VOLC_ASR_APP_ID / VOLC_ASR_ACCESS_TOKEN
+app_id_env = "VOLC_ASR_APP_ID"
+access_token_env = "VOLC_ASR_ACCESS_TOKEN"
+# 资源 ID，对应已开通的服务；大模型录音文件识别标准版为 volc.bigasr.auc
+resource_id = "volc.bigasr.auc"
 
 [audio]
 # 麦克风设备名关键词，留空 = 系统默认输入设备
@@ -44,11 +55,18 @@ base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
 
 [ai.prompts]
-# 清洗 prompt。想调整清洗风格（更激进纠错 / 不同语气）改这里即可。
+# 清洗 prompt。右键悬浮球，在「整理模式」里切换。
+#   default  = 默认：修错字、补标点、清口水词，只输出干净文本
+#   markdown = 进阶：把口述内容整理成结构化 Markdown
 default = "你是语音转写清洗专家。修正 ASR 转写错误（尤其技术专有名词），加合理标点，保持原意不增删。只输出清洗后的纯文本一行，不要解释。"
+markdown = "你是语音内容整理助手。把用户口述的内容整理成结构清晰的 Markdown：先给一个 ## 标题，再用列表分点；去掉口语冗余和口水词；专有名词严格以参考词典为准、不要写错；不要增加原文没有的信息。直接输出 Markdown 正文，不要解释。"
 
 [ui]
 # 悬浮球直径（像素）
 ball_size = 44
 # 是否总在最前
 always_on_top = true
+# 演示模式：录视频时设为 true —— 悬浮球放大、球上显示状态文字、历史面板字号加大
+demo_mode = false
+# 演示模式下的悬浮球直径（日常的 ball_size 不受影响）
+ball_size_demo = 80
