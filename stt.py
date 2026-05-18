@@ -10,6 +10,42 @@ import numpy as np
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
 
+# SenseVoice int8 模型（sherpa-onnx 官方发布，约 230MB）
+SENSEVOICE_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
+)
+
+
+def _download_sensevoice(sv_dir: Path) -> None:
+    """首次使用 SenseVoice 时自动下载并解压模型到 models/sensevoice/。"""
+    import tarfile
+    import urllib.request
+
+    sv_dir.mkdir(parents=True, exist_ok=True)
+    archive = sv_dir / "_sensevoice.tar.bz2"
+    print("[voice2text] 首次使用 SenseVoice，正在下载语音模型（约 230MB），请稍候…")
+
+    def _hook(blocks: int, bsize: int, total: int) -> None:
+        if total > 0:
+            pct = min(100, blocks * bsize * 100 // total)
+            print(f"\r  下载中… {pct}%", end="", flush=True)
+
+    try:
+        urllib.request.urlretrieve(SENSEVOICE_URL, archive, _hook)
+        print()
+        with tarfile.open(archive, "r:bz2") as tar:
+            for m in tar.getmembers():
+                base = Path(m.name).name
+                if base in ("model.int8.onnx", "tokens.txt"):
+                    m.name = base  # 扁平化，去掉压缩包内层目录
+                    tar.extract(m, sv_dir)
+    finally:
+        if archive.exists():
+            archive.unlink()
+    if not (sv_dir / "model.int8.onnx").exists():
+        raise RuntimeError("下载完成但未找到 model.int8.onnx")
+
 
 class STTEngine:
     """Interface for a speech-to-text engine."""
@@ -48,8 +84,8 @@ class FasterWhisperEngine(STTEngine):
 
 
 class SenseVoiceEngine(STTEngine):
-    """SenseVoice via sherpa-onnx. Faster + better Chinese, but the model
-    must be downloaded manually first (see README)."""
+    """SenseVoice via sherpa-onnx. Default engine — fast + accurate Chinese.
+    Model (~230MB) auto-downloads on first use."""
 
     def __init__(self, language: str = "zh"):
         import sherpa_onnx
@@ -57,11 +93,14 @@ class SenseVoiceEngine(STTEngine):
         model = sv_dir / "model.int8.onnx"
         tokens = sv_dir / "tokens.txt"
         if not model.exists() or not tokens.exists():
-            raise RuntimeError(
-                f"SenseVoice 模型未找到（应在 {sv_dir}）。"
-                "请见 README「切换 STT 引擎」一节下载模型，"
-                "或把 config.toml 的 [stt] backend 改回 faster-whisper。"
-            )
+            try:
+                _download_sensevoice(sv_dir)
+            except Exception as e:
+                raise RuntimeError(
+                    f"SenseVoice 模型下载失败：{e}\n"
+                    "请检查网络后重启重试；或把 config.toml 的 [stt] backend "
+                    "改成 faster-whisper（首次会自动下载约 1.5GB 模型）。"
+                ) from e
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=str(model),
             tokens=str(tokens),

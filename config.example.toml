@@ -9,13 +9,13 @@
 key = "caps lock"
 
 [stt]
-# 语音识别引擎: faster-whisper | sensevoice | volcengine
-#   faster-whisper = 本地，默认，纯 CPU 较慢
-#   sensevoice     = 本地，更快更准的中文（模型需手动下载，见 README）
-#   volcengine     = 火山引擎云端，最快，但音频会上传云端（凭证填 .env）
-backend = "faster-whisper"
+# 语音识别引擎: sensevoice | faster-whisper | volcengine
+#   sensevoice     = 本地，默认，中文又快又准，首次自动下载模型（约 230MB）
+#   faster-whisper = 本地，纯 CPU 较慢，首次自动下载模型（约 1.5GB）
+#   volcengine     = 火山引擎云端，但音频会上传云端（凭证填 .env）
+backend = "sensevoice"
 # faster-whisper 模型: tiny | base | small | medium | large-v3
-# 越大越准越慢；medium 适合 CPU。其它后端忽略此项。
+# 越大越准越慢；medium 适合 CPU。仅 faster-whisper 后端用此项。
 model = "medium"
 # 计算设备: cpu | cuda
 device = "cpu"
